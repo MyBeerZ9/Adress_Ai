@@ -1,96 +1,58 @@
-"""FastAPI integration for an address NER model.
-
-Import `MLAddressParser` into your existing FastAPI app and call `parse_ml_address`.
-The geocoding function is deliberately injected so this module can reuse your existing
-Google Geocoding implementation without duplicating credentials or HTTP logic.
-"""
+"""FastAPI integration for the fine-tuned Indian address NER model."""
 from __future__ import annotations
 
+import inspect
 import os
-from typing import Callable, Any
+from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
 
-MODEL_ID = os.getenv("ADDRESS_NER_MODEL", "YOUR_HF_USERNAME/indian-address-ner")
+MODEL_ID = os.getenv("ADDRESS_NER_MODEL", "")
 LOCAL_MODEL = os.getenv("ADDRESS_NER_LOCAL_PATH", "")
 CONFIDENCE_THRESHOLD = float(os.getenv("ADDRESS_NER_CONFIDENCE", "0.55"))
-
 LABELS = {"HOUSE", "STREET", "LANDMARK", "AREA", "CITY", "STATE", "PIN"}
 
 
-class ParseRequest(BaseModel):
-    address: str
-
-
 class MLAddressParser:
+    """Lazy-loading NER wrapper that reuses the app's existing geocoder."""
+
     def __init__(self, geocode: Callable[[str], Any]):
-        """geocode(query) should be your existing Google geocoder function."""
         self.geocode = geocode
+        self._ner = None
+
+    def _load_model(self):
+        if self._ner is not None:
+            return self._ner
         model_path = LOCAL_MODEL or MODEL_ID
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.model = AutoModelForTokenClassification.from_pretrained(model_path)
-        self.ner = pipeline(
-            "token-classification",
-            model=self.model,
-            tokenizer=self.tokenizer,
-            aggregation_strategy="simple",
-        )
+        if not model_path:
+            raise RuntimeError("Set ADDRESS_NER_MODEL or ADDRESS_NER_LOCAL_PATH before using /parse_ml")
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        model = AutoModelForTokenClassification.from_pretrained(model_path)
+        self._ner = pipeline("token-classification", model=model, tokenizer=tokenizer, aggregation_strategy="simple")
+        return self._ner
 
     def extract(self, address: str) -> tuple[dict[str, str], float]:
-        entities = self.ner(address)
+        entities = self._load_model()(address)
         components: dict[str, list[str]] = {}
-        scores = []
+        scores: list[float] = []
         for entity in entities:
-            raw_label = str(entity["entity_group"]).replace("B-", "").replace("I-", "")
-            if raw_label not in LABELS:
+            label = str(entity.get("entity_group", "")).replace("B-", "").replace("I-", "")
+            if label not in LABELS:
                 continue
-            components.setdefault(raw_label, []).append(str(entity["word"]).strip())
-            scores.append(float(entity["score"]))
-        result = {k: " ".join(v) for k, v in components.items()}
+            components.setdefault(label, []).append(str(entity.get("word", "")).strip())
+            scores.append(float(entity.get("score", 0.0)))
         confidence = sum(scores) / len(scores) if scores else 0.0
-        return result, confidence
+        return {k: " ".join(v) for k, v in components.items()}, confidence
 
-    def parse(self, address: str) -> dict[str, Any]:
+    async def _call_geocoder(self, query: str):
+        result = self.geocode(query)
+        return await result if inspect.isawaitable(result) else result
+
+    async def parse(self, address: str) -> dict[str, Any]:
         components, confidence = self.extract(address)
-        # Avoid malformed queries when optional fields are absent.
-        query_parts = [
-            components.get("HOUSE", ""),
-            components.get("STREET", ""),
-            components.get("AREA", ""),
-            components.get("CITY", ""),
-            components.get("PIN", ""),
-        ]
-        cleaned_query = ", ".join(p for p in query_parts if p)
-
+        cleaned_query = ", ".join(components.get(k, "") for k in ("HOUSE", "STREET", "AREA", "CITY", "PIN") if components.get(k))
         if confidence < CONFIDENCE_THRESHOLD or not cleaned_query:
-            geocode_result = self.geocode(address)
-            return {
-                "method": "raw_fallback",
-                "confidence": confidence,
-                "components": components,
-                "query": address,
-                "geocode": geocode_result,
-            }
-
-        geocode_result = self.geocode(cleaned_query)
-        return {
-            "method": "ml",
-            "confidence": confidence,
-            "components": components,
-            "query": cleaned_query,
-            "geocode": geocode_result,
-        }
-
-
-# Example wiring:
-# from your_existing_module import google_geocode
-# parser = MLAddressParser(google_geocode)
-# router = APIRouter()
-# @router.post("/parse_ml")
-# def parse_ml(req: ParseRequest):
-#     try:
-#         return parser.parse(req.address)
-#     except Exception as exc:
-#         raise HTTPException(status_code=500, detail=str(exc))
+            result = await self._call_geocoder(address)
+            return {"method": "raw_fallback", "confidence": confidence, "components": components, "query": address, "geocode": result}
+        result = await self._call_geocoder(cleaned_query)
+        return {"method": "ml", "confidence": confidence, "components": components, "query": cleaned_query, "geocode": result}
